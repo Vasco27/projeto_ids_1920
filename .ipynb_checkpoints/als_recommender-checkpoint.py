@@ -1,36 +1,114 @@
+import random
 import pandas as pd
 import numpy as np
+
 import scipy.sparse as sparse
 from scipy.sparse.linalg import spsolve
-import implicit
-    
+from sklearn.preprocessing import MinMaxScaler
+
 class ALSRecommender():
-    def __init__(self, iterations = 20, latent = 10, alpha = 40, regularizer = 0.1):        
+
+
+    def __init__(self, iterations = 20, latent = 10, alpha_val = 40, regularizer = 0.1):        
         self.iterations = iterations
-        self.latent = latent
-        self.alpha = 40
-        self.regularizer = 0.1
-        self.S = None
+        self.features = latent
+        self.alpha_val = alpha_val
+        self.lambda_val = regularizer
 
-    def fit(self, sample):
-        #Instead of pivot_table the als from the implicit library expects a sparse matrix
-        self.S = sample
-        self.S.movieId = self.S.movieId.astype("category").cat.codes
-        self.S.userId = self.S.userId.astype("category").cat.codes
-        self.movie_user_matrix = sparse.csr_matrix((self.S.rating.astype(float), (self.S.movieId, self.S.userId)))
-        self.user_movie_matrix = sparse.csr_matrix((self.S.rating.astype(float), (self.S.userId, self.S.movieId)))
-        
-        confidence = (self.movie_user_matrix * self.alpha).astype("double")
+    def fit(self, sparse_data):
+        """ Implementation of Alternating Least Squares with implicit data. We iteratively
+        compute the user (x_u) and item (y_i) vectors using the following formulas:
 
-        #Als model with 10 latent factor, lambda = 0.1 and 20 alternating iterations
-        als_model = implicit.als.AlternatingLeastSquares(factors = self.latent, regularization = self.regularizer, iterations = self.iterations)
-        als_model.fit(confidence)
-        
-        self.user_vectors = als_model.user_factors
-        self.movie_vectors = als_model.item_factors
-        
-        return self.user_vectors, self.movie_vectors
+        x_u = ((Y.T*Y + Y.T*(Cu - I) * Y) + lambda*I)^-1 * (X.T * Cu * p(u))
+        y_i = ((X.T*X + X.T*(Ci - I) * X) + lambda*I)^-1 * (Y.T * Ci * p(i))
+
+        Args:
+            sparse_data (csr_matrix): Our sparse user-by-item matrix
+
+            alpha_val (int): The rate in which we'll increase our confidence
+            in a preference with more interactions.
+
+            iterations (int): How many times we alternate between fixing and 
+            updating our user and item vectors
+
+            lambda_val (float): Regularization value
+
+            features (int): How many latent features we want to compute.
+
+        Returns:     
+            X (csr_matrix): user vectors of size users-by-features
+
+            Y (csr_matrix): item vectors of size items-by-features
+         """
+
+        # Calculate the foncidence for each value in our data
+        confidence = sparse_data * self.alpha_val
+
+        # Get the size of user rows and item columns
+        user_size, item_size = sparse_data.shape
+
+        # We create the user vectors X of size users-by-features, the item vectors
+        # Y of size items-by-features and randomly assign the values.
+        X = sparse.csr_matrix(np.random.normal(size = (user_size, self.features)))
+        Y = sparse.csr_matrix(np.random.normal(size = (item_size, self.features)))
+
+        #Precompute I and lambda * I
+        X_I = sparse.eye(user_size)
+        Y_I = sparse.eye(item_size)
+
+        I = sparse.eye(self.features)
+        lI = self.lambda_val * I
+
+        # Start main loop. For each iteration we first compute X and then Y
+        for i in range(self.iterations):
+            print('iteration', i+1, 'of', self.iterations)
+
+            # Precompute Y-transpose-Y and X-transpose-X
+            yTy = Y.T.dot(Y)
+            xTx = X.T.dot(X)
+
+            # Loop through all users
+            for u in range(user_size):
+
+                # Get the user row.
+                u_row = confidence[u,:].toarray() 
+
+                # Calculate the binary preference p(u)
+                p_u = u_row.copy()
+                p_u[p_u != 0] = 1.0
+
+                # Calculate Cu and Cu - I
+                CuI = sparse.diags(u_row, [0])
+                Cu = CuI + Y_I
+
+                # Put it all together and compute the final formula
+                yT_CuI_y = Y.T.dot(CuI).dot(Y)
+                yT_Cu_pu = Y.T.dot(Cu).dot(p_u.T)
+                X[u] = spsolve(yTy + yT_CuI_y + lI, yT_Cu_pu)
+
+
+            for i in range(item_size):
+
+                # Get the item column and transpose it.
+                i_row = confidence[:,i].T.toarray()
+
+                # Calculate the binary preference p(i)
+                p_i = i_row.copy()
+                p_i[p_i != 0] = 1.0
+
+                # Calculate Ci and Ci - I
+                CiI = sparse.diags(i_row, [0])
+                Ci = CiI + X_I
+
+                # Put it all together and compute the final formula
+                xT_CiI_x = X.T.dot(CiI).dot(X)
+                xT_Ci_pi = X.T.dot(Ci).dot(p_i.T)
+                Y[i] = spsolve(xTx + xT_CiI_x + lI, xT_Ci_pi)
     
+        self.user_vec = X
+        self.item_vec = Y
+        return X, Y
+
     def similar_to_movie(self, movie_id, n_similar):
         #scores = V dot V.T[movie] -> Item recommendation
         movie_vec = self.movie_vectors[movie_id].T #será que posso fazer com a movie_user_matrix? assim dava para testar
@@ -50,7 +128,6 @@ class ALSRecommender():
             
         return pd.DataFrame({"movie_title": titles, "similarity": similarity})
     
-    #user_movie_matrix deve ser um parametro (para poder passar uma test sample)
     def recommend_to_user(self, user_id, n_movies, user_movie_matrix):
         user_ratings = user_movie_matrix[user_id,:].toarray().reshape(-1) + 1 #ratings do user escolhido (1d array)
         #ratings de filmes não vistos ficam com rating 1, enquanto os que já foram vistos são postos a 0 para não serem recomendados
@@ -78,3 +155,40 @@ class ALSRecommender():
             scores.append(recommend_vector[i])
 
         return pd.DataFrame({"movie_title" : titles, "score": scores})
+    
+    
+    
+    def recommend(self, user_id, data_sparse, item_lookup, num_items=10):  
+        # Get all interactions by the user
+        user_interactions = data_sparse[user_id,:].toarray()
+
+        # We don't want to recommend items the user has consumed. So let's
+        # set them all to 0 and the unknowns to 1.
+        user_interactions = user_interactions.reshape(-1) + 1 #Reshape to turn into 1D array
+        user_interactions[user_interactions > 1] = 0
+
+        # This is where we calculate the recommendation by taking the 
+        # dot-product of the user vectors with the item vectors.
+        rec_vector = self.user_vec[user_id,:].dot(self.item_vec.T).toarray()
+
+        # Let's scale our scores between 0 and 1 to make it all easier to interpret.
+        min_max = MinMaxScaler()
+        rec_vector_scaled = min_max.fit_transform(rec_vector.reshape(-1,1))[:,0]
+        recommend_vector = user_interactions*rec_vector_scaled
+
+        # Get all the artist indices in order of recommendations (descending) and
+        # select only the top "num_items" items. 
+        item_idx = np.argsort(recommend_vector)[::-1][:num_items]
+
+        movies = []
+        scores = []
+
+        # Loop through our recommended artist indicies and look up the actial artist name
+        for idx in item_idx:
+            movies.append(item_lookup.title.loc[item_lookup.movie_id == str(idx)].iloc[0])
+            scores.append(recommend_vector[idx])
+
+        # Create a new dataframe with recommended artist names and scores
+        recommendations = pd.DataFrame({'movie': movies, 'score': scores})
+
+        return recommendations
